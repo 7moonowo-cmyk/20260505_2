@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>京劇臉譜跨裝置互動</title>
+    <script src="https://cdn.jsdelivr.net/npm/peerjs@1.4.7/dist/peerjs.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            background-color: black;
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            color: white;
+            font-family: sans-serif;
+        }
+        #canvas {
+            width: 100vw;
+            height: 100vh;
+            object-fit: contain;
+        }
+        #ui-layer {
+            position: absolute;
+            z-index: 10;
+            text-align: center;
+        }
+        #qrcode {
+            padding: 10px;
+            background: white;
+            margin-bottom: 10px;
+            display: inline-block;
+        }
+        #status {
+            font-size: 14px;
+            color: #aaa;
+        }
+        video {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="ui-layer">
+        <div id="qrcode"></div>
+        <p id="instruction">請用另一台裝置掃描 QR Code 作為攝影機</p>
+        <p id="status">正在初始化元件...</p>
+    </div>
+
+    <canvas id="canvas"></canvas>
+    <video id="remoteVideo" autoplay playsinline></video>
+
+    <script type="module">
+        import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/vision_bundle.mjs";
+
+        const canvasElement = document.getElementById("canvas");
+        const canvasCtx = canvasElement.getContext("2d");
+        const remoteVideo = document.getElementById("remoteVideo");
+        const uiLayer = document.getElementById("ui-layer");
+        const statusText = document.getElementById("status");
+
+        let faceLandmarker;
+        let peer;
+        let maskImage = new Image();
+        maskImage.crossOrigin = "anonymous";
+        maskImage.onload = () => console.log("京劇臉譜圖片載入完成");
+        maskImage.src = "https://upload.wikimedia.org/wikipedia/commons/thumb/e/ef/Beijing_Opera_Mask.svg/512px-Beijing_Opera_Mask.svg.png";
+
+        const urlParams = new URLSearchParams(window.location.search);
+        const remoteId = urlParams.get('peerId');
+
+        async function setupFaceDetection() {
+            statusText.innerText = "正在載入 AI 模型...";
+            const filesetResolver = await FilesetResolver.forVisionTasks(
+                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/wasm"
+            );
+            faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
+                baseOptions: {
+                    modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+                    delegate: "GPU"
+                },
+                outputFaceBlendshapes: true,
+                runningMode: "VIDEO",
+                numFaces: 1
+            });
+            statusText.innerText = "AI 模型載入完成，正在建立 Peer 連線...";
+        }
+
+        function initPeer() {
+            statusText.innerText = "正在建立 Peer 連線...";
+            peer = new Peer();
+
+            peer.on('open', (id) => {
+                if (!remoteId) {
+                    console.log("PeerJS 連線已開啟，ID:", id);
+                    const connectionUrl = `${window.location.origin}${window.location.pathname}?peerId=${id}`;
+                    new QRCode(document.getElementById("qrcode"), {
+                        text: connectionUrl,
+                        width: 256,
+                        height: 256
+                    });
+                    statusText.innerText = "等待攝影機連線...";
+                } else {
+                    console.log("偵測到 remoteId，進入攝影機模式，嘗試連線到:", remoteId);
+                    uiLayer.innerHTML = "<h1>攝影機模式</h1><p>正在嘗試開啟攝影機並分享影像...</p>";
+                    startCamera(remoteId);
+                }
+            });
+
+            peer.on('call', (call) => {
+                console.log("收到來自遠端的呼叫");
+                call.answer();
+                call.on('stream', (remoteStream) => {
+                    console.log("收到影像串流，開始顯示");
+                    uiLayer.style.display = 'none';
+                    remoteVideo.srcObject = remoteStream;
+                    remoteVideo.onplay = () => { // 將 onloadeddata 改為 onplay
+                        predictWebcam();
+                    };
+                });
+            });
+
+            peer.on('error', (err) => {
+                console.error("PeerJS Error:", err);
+                statusText.innerText = "連線錯誤: " + err.type;
+            });
+        }
+
+        async function startCamera(targetId) {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { facingMode: "user" }, 
+                    audio: false 
+                });
+                console.log("取得攝影機串流，呼叫 Peer:", targetId);
+                peer.call(targetId, stream);
+            } catch (err) {
+                alert("無法取得攝影機權限，請確認是否為 HTTPS 環境或已授權: " + err.message);
+            }
+        }
+
+        let lastVideoTime = -1;
+        async function predictWebcam() {
+            if (remoteVideo.videoWidth > 0 && lastVideoTime !== remoteVideo.currentTime) {
+                // console.log("正在處理影像幀...");
+                lastVideoTime = remoteVideo.currentTime;
+                
+                if (canvasElement.width !== remoteVideo.videoWidth) {
+                    canvasElement.width = remoteVideo.videoWidth;
+                    canvasElement.height = remoteVideo.videoHeight;
+                }
+
+                const results = faceLandmarker.detectForVideo(remoteVideo, performance.now());
+                canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+                canvasCtx.drawImage(remoteVideo, 0, 0, canvasElement.width, canvasElement.height);
+
+                if (results.faceLandmarks && results.faceLandmarks.length > 0) {
+                    drawMask(results.faceLandmarks[0]);
+                }
+            }
+            requestAnimationFrame(predictWebcam);
+        }
+
+        function drawMask(landmarks) {
+            const top = landmarks[10];
+            const bottom = landmarks[152];
+            const left = landmarks[234];
+            const right = landmarks[454];
+
+            const width = Math.abs(right.x - left.x) * canvasElement.width * 1.5;
+            const height = Math.abs(bottom.y - top.y) * canvasElement.height * 1.5;
+            
+            const centerX = landmarks[1].x * canvasElement.width;
+            const centerY = landmarks[1].y * canvasElement.height;
+
+            const eyeLeft = landmarks[33];
+            const eyeRight = landmarks[263];
+            const rotation = Math.atan2(eyeRight.y - eyeLeft.y, eyeRight.x - eyeLeft.x);
+
+            canvasCtx.save();
+            canvasCtx.translate(centerX, centerY);
+            canvasCtx.rotate(rotation);
+            canvasCtx.drawImage(maskImage, -width / 2, -height / 1.8, width, height);
+            canvasCtx.restore();
+        }
+
+        setupFaceDetection().then(initPeer).catch(err => {
+            console.error(err);
+            statusText.innerText = "初始化失敗: " + err.message;
+        });
+    </script>
+</body>
+</html>
